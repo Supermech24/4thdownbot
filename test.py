@@ -1,13 +1,12 @@
-# simulate_one_4th_down.py
-# Edit ONE scenario below and print WP_go, WP_punt, WP_fg.
+# test.py
+# Edit inputs below and get expected WP values for each 4th down decision
 #
 # Requires trained models saved in ./models by mvp_4th_down_bot.py:
-#   - models/wp_model.joblib
-#   - models/fg_model.joblib
-#   - models/go_conv_model.joblib
-#   - models/punt_gross_dist.npy
+#   - models/go_wp_model.joblib
+#   - models/fg_wp_model.joblib
+#   - models/punt_wp_model.joblib
 #
-# Usage: python simulate_one_4th_down.py
+# Usage: python test.py
 
 import numpy as np
 import pandas as pd
@@ -17,211 +16,222 @@ from pathlib import Path
 # =========================
 # EDIT THESE INPUTS
 # =========================
-Yardline              = 10.0   # distance from opponent end zone (1..99). 40 => own 40.
-Quarter               = 4.0    # 1..4 (ignore OT for MVP)
-Time_remaining        = 60.0  # seconds left in game
-Timeouts_offense      = 0.0    # Ravens timeouts remaining
-Timeouts_defense      = 0.0    # Opponent timeouts remaining
-Score_differential    = 10.0    # Ravens score - Opp score (negative if trailing)
-Yds_to_go             = 2.0   # yards for a first down
-Wind_speed            = 6.0    # mph (FG model)
-Offense_strength      = 0.05   # your rating; 0 = league avg
-Opp_defense_strength  = -0.05  # opponent defensive rating; 0 = league avg
+Yardline              = 25   # distance from opponent end zone (1..99). 40 => own 40.
+Quarter               = 3.0    # 1..4
+Time_remaining        = 200.0   # seconds left (in quarter for Q1/Q2, in game for Q3/Q4)
+Score_differential    = 0   # Ravens score - Opp score (negative if trailing)
+Yds_to_go             = 10.0    # yards for a first down
+Wind_speed            = 0.0    # mph (affects FG model)
+Offense_strength      = 0.05   # Ravens offensive rating; 0 = league avg
+Opp_defense_strength  = -0.05  # Opponent defensive rating; 0 = league avg
 
 # =========================
 # Paths
 # =========================
 MODEL_DIR = Path("models")
-WP_MODEL_PATH  = MODEL_DIR / "wp_model.joblib"
-FG_MODEL_PATH  = MODEL_DIR / "fg_model.joblib"
-GO_MODEL_PATH  = MODEL_DIR / "go_conv_model.joblib"
-PUNT_DIST_PATH = MODEL_DIR / "punt_gross_dist.npy"
+GO_WP_MODEL_PATH = MODEL_DIR / "go_wp_model.joblib"
+FG_WP_MODEL_PATH = MODEL_DIR / "fg_wp_model.joblib"
+PUNT_WP_MODEL_PATH = MODEL_DIR / "punt_wp_model.joblib"
 
-# Feature lists
-WP_FEATURES = [
-    "yardline_100",
-    "qtr",
-    "game_seconds_remaining",
-    "posteam_timeouts_remaining",
-    "defteam_timeouts_remaining",
-    "score_differential",
-    "offensive_rating",
-    "opponent_defensive_rating",
-]
+# =========================
+# Feature Engineering (same as training)
+# =========================
+def create_features_from_inputs(yardline, quarter, time_remaining, score_differential, 
+                                yds_to_go, wind, offense_strength, opp_defense_strength):
+    """
+    Create features from user inputs to match the training data format.
+    """
+    # Time left in half (combination of quarter and time remaining)
+    # For Q1/Q2: use quarter_seconds_remaining (first half)
+    # For Q3/Q4: use game_seconds_remaining (second half/end of game)
+    # 
+    # Interpretation: time_remaining is the seconds left in the current quarter for Q1/Q2,
+    #                  or game_seconds_remaining for Q3/Q4
+    if quarter in [1, 2]:
+        # Q1/Q2: time_remaining is interpreted as seconds left in that quarter
+        time_left_in_half = float(time_remaining)
+    else:
+        # Q3/Q4: time_remaining is interpreted as game_seconds_remaining
+        time_left_in_half = float(time_remaining)
+    
+    # Own territory indicator (yardline > 50 means own territory)
+    own_territory = 1 if yardline > 50 else 0
+    
+    # Late in half indicator (less than 2 minutes)
+    late_in_half = 1 if time_left_in_half < 120 else 0
+    
+    # End of half/game (Q2 or Q4 with low time)
+    end_of_half = 1 if (quarter in [2, 4] and time_left_in_half < 300) else 0
+    
+    # Score differential categories
+    down_by_more_than_3 = 1 if score_differential < -3 else 0
+    up_by_a_lot = 1 if score_differential > 14 else 0
+    
+    # Yardline > 40 indicator (FG and punt logic)
+    yardline_over_40 = 1 if yardline > 40 else 0
+    
+    # Non-linear yardline features to capture threshold effects
+    distance_from_40 = float(yardline) - 40.0
+    distance_from_40_squared = distance_from_40 ** 2
+    inside_40 = 1 if yardline <= 40 else 0
+    yardline_inside_40 = float(yardline) * inside_40
+    around_40 = 1 if (yardline >= 35 and yardline <= 45) else 0
+    beyond_40 = 1 if yardline > 40 else 0
+    yardline_beyond_40 = (float(yardline) - 40) * beyond_40
+    
+    # Interaction: own territory AND not late in half (should reduce go-for-it WP)
+    own_territory_not_late = 1 if (own_territory == 1 and late_in_half == 0) else 0
+    
+    # Interaction: down by more than 3 AND late in half (should increase go-for-it WP)
+    down_late = 1 if (down_by_more_than_3 == 1 and late_in_half == 1) else 0
+    
+    return {
+        'yardline_100': float(yardline),
+        'own_territory': own_territory,
+        'time_left_in_half': float(time_left_in_half),
+        'late_in_half': late_in_half,
+        'end_of_half': end_of_half,
+        'score_differential': float(score_differential),
+        'down_by_more_than_3': down_by_more_than_3,
+        'down_late': down_late,
+        'own_territory_not_late': own_territory_not_late,
+        'ydstogo': float(yds_to_go),
+        'offensive_rating': float(offense_strength),
+        'opponent_defensive_rating': float(opp_defense_strength),
+        'yardline_over_40': yardline_over_40,
+        'distance_from_40': distance_from_40,
+        'distance_from_40_squared': distance_from_40_squared,
+        'inside_40': inside_40,
+        'around_40': around_40,
+        'yardline_beyond_40': yardline_beyond_40,
+        'wind': float(wind),
+    }
+
+# =========================
+# Load Models
+# =========================
+print("Loading models...")
+go_wp_model = joblib.load(GO_WP_MODEL_PATH)
+fg_wp_model = joblib.load(FG_WP_MODEL_PATH)
+punt_wp_model = joblib.load(PUNT_WP_MODEL_PATH)
+print("Models loaded successfully!\n")
+
+# =========================
+# Create Features from Inputs
+# =========================
+features = create_features_from_inputs(
+    yardline=Yardline,
+    quarter=Quarter,
+    time_remaining=Time_remaining,
+    score_differential=Score_differential,
+    yds_to_go=Yds_to_go,
+    wind=Wind_speed,
+    offense_strength=Offense_strength,
+    opp_defense_strength=Opp_defense_strength
+)
+
+# =========================
+# Predict WP for Each Decision
+# =========================
+# Go-for-it WP Model features
 GO_FEATURES = [
-    "yardline_100",
-    "ydstogo",
-    "qtr",
-    "game_seconds_remaining",
-    "score_differential",
-    "posteam_timeouts_remaining",
-    "defteam_timeouts_remaining",
-    "offensive_rating",
-    "opponent_defensive_rating",
+    'yardline_100',
+    'own_territory',
+    'time_left_in_half',
+    'end_of_half',
+    'score_differential',
+    'down_by_more_than_3',
+    'down_late',
+    'own_territory_not_late',
+    'ydstogo',
+    'offensive_rating',
+    'opponent_defensive_rating'
 ]
 
-# Load models
-wp_model = joblib.load(WP_MODEL_PATH)
-fg_model = joblib.load(FG_MODEL_PATH)
-go_model = joblib.load(GO_MODEL_PATH)
-punt_gross = np.load(PUNT_DIST_PATH).astype(float)
+# Field Goal WP Model features - includes non-linear yardline features
+FG_FEATURES = [
+    'yardline_100',
+    'yardline_over_40',
+    'distance_from_40',
+    'distance_from_40_squared',
+    'inside_40',
+    'around_40',
+    'yardline_beyond_40',
+    'time_left_in_half',
+    'end_of_half',
+    'score_differential',
+    'down_by_more_than_3',
+    'wind'
+]
 
-# ---------------- Helpers ----------------
-def clamp_yl(y):
-    return float(np.clip(float(y), 1.0, 99.0))
+# Punt WP Model features
+PUNT_FEATURES = [
+    'yardline_100',
+    'yardline_over_40',
+    'time_left_in_half',
+    'end_of_half',
+    'score_differential'
+]
 
-def wp_offense(state_dict):
-    """WP for whoever has the ball in `state_dict` coordinates."""
-    row = pd.DataFrame([state_dict])
-    for k in WP_FEATURES:
-        if k not in row.columns:
-            row[k] = np.nan
-    return float(np.clip(wp_model.predict(row[WP_FEATURES])[0], 0.0, 1.0))
+# Create DataFrames for predictions
+go_input = pd.DataFrame([{k: features[k] for k in GO_FEATURES}])
+fg_input = pd.DataFrame([{k: features[k] for k in FG_FEATURES}])
+punt_input = pd.DataFrame([{k: features[k] for k in PUNT_FEATURES}])
 
-def flip_possession(state_ravens_persp):
-    """
-    Convert Ravens-perspective state (Ravens yardline_100, Ravens timeouts,
-    score_differential = Ravens - Opp) to an opponent-offense state.
-    """
-    out = state_ravens_persp.copy()
-    out["yardline_100"] = 100.0 - float(out["yardline_100"])
-    out["score_differential"] = -float(out["score_differential"])
-    # swap timeouts
-    to_off = float(out["posteam_timeouts_remaining"])
-    to_def = float(out["defteam_timeouts_remaining"])
-    out["posteam_timeouts_remaining"] = to_def
-    out["defteam_timeouts_remaining"] = to_off
-    # swap ratings (simple symmetric MVP)
-    off_r = float(out.get("offensive_rating", 0.0))
-    def_r = float(out.get("opponent_defensive_rating", 0.0))
-    out["offensive_rating"] = -def_r
-    out["opponent_defensive_rating"] = -off_r
-    return out
+# Predict WP values
+wp_go = float(np.clip(go_wp_model.predict(go_input)[0], 0.0, 1.0))
+wp_fg = float(np.clip(fg_wp_model.predict(fg_input)[0], 0.0, 1.0))
+wp_punt = float(np.clip(punt_wp_model.predict(punt_input)[0], 0.0, 1.0))
 
-def ravens_wp_on_offense(state_ravens_offense):
-    """Ravens have the ball -> ask offense WP directly."""
-    return wp_offense(state_ravens_offense)
+# =========================
+# Enforce Constraints
+# =========================
+# Field goal should always be better than punt inside the 40 yardline
+constraint_applied = False
+if Yardline < 40:
+    original_fg_wp = wp_fg
+    # Ensure FG WP is at least as high as Punt WP
+    wp_fg = max(wp_fg, wp_punt)
+    if original_fg_wp < wp_punt:
+        constraint_applied = True
 
-def ravens_wp_when_opponent_has_ball(state_ravens_persp):
-    """
-    Opponent has the ball: flip to opponent-offense, get opponent WP,
-    then convert to Ravens WP as 1 - opponent WP.
-    """
-    opp_offense_state = flip_possession(state_ravens_persp)
-    opp_wp = wp_offense(opp_offense_state)
-    return 1.0 - opp_wp
+# =========================
+# Display Results
+# =========================
+best = max(wp_go, wp_punt, wp_fg)
+rec = "GO" if best == wp_go else ("PUNT" if best == wp_punt else "FG")
 
-def p_fg_make_from_yardline(yardline_100, wind=0.0, temp=60.0, roof_is_indoor=0.0):
-    dist = float(yardline_100) + 17.0
-    row = pd.DataFrame([{
-        "kick_distance": dist,
-        "temp": temp,
-        "wind": wind,
-        "roof_is_indoor": roof_is_indoor
-    }])
-    return float(fg_model.predict_proba(row)[0, 1]), dist
-
-def p_go_convert(go_state):
-    r = pd.DataFrame([go_state])
-    for k in GO_FEATURES:
-        if k not in r.columns:
-            r[k] = np.nan
-    return float(go_model.predict_proba(r[GO_FEATURES])[0, 1])
-
-def sample_punt_gross(n=600, rng=None):
-    rng = np.random.default_rng(rng)
-    return rng.choice(punt_gross, size=n, replace=True)
-
-# Base Ravens state (offense)
-base_state = {
-    "yardline_100": float(Yardline),
-    "qtr": float(Quarter),
-    "game_seconds_remaining": float(Time_remaining),
-    "posteam_timeouts_remaining": float(Timeouts_offense),
-    "defteam_timeouts_remaining": float(Timeouts_defense),
-    "score_differential": float(Score_differential),
-    "offensive_rating": float(Offense_strength),
-    "opponent_defensive_rating": float(Opp_defense_strength),
-}
-
-# ---------------- Action evaluators ----------------
-def WP_go():
-    ydstogo = float(Yds_to_go)
-
-    # Properly trained on 4th-down attempts only
-    p_conv = p_go_convert({
-        "yardline_100": base_state["yardline_100"],
-        "ydstogo": ydstogo,
-        "qtr": base_state["qtr"],
-        "game_seconds_remaining": base_state["game_seconds_remaining"],
-        "score_differential": base_state["score_differential"],
-        "posteam_timeouts_remaining": base_state["posteam_timeouts_remaining"],
-        "defteam_timeouts_remaining": base_state["defteam_timeouts_remaining"],
-        "offensive_rating": base_state["offensive_rating"],
-        "opponent_defensive_rating": base_state["opponent_defensive_rating"],
-    })
-
-    # Success: Ravens keep ball, 1st & 10 at (yardline - ydstogo)
-    success = base_state.copy()
-    success["yardline_100"] = clamp_yl(base_state["yardline_100"] - ydstogo)
-    wp_success = ravens_wp_on_offense(success)
-
-    # Fail: opponent ball at LOS
-    fail = base_state.copy()
-    wp_fail = ravens_wp_when_opponent_has_ball(fail)
-
-    return p_conv * wp_success + (1.0 - p_conv) * wp_fail
-
-def WP_fg():
-    wind = float(Wind_speed)
-    p_make, dist = p_fg_make_from_yardline(base_state["yardline_100"], wind=wind, temp=60.0, roof_is_indoor=0.0)
-
-    # MAKE -> +3 points, opponent gets ball (approx start at their 25 -> Ravens yardline_100 = 75)
-    make_state = base_state.copy()
-    make_state["score_differential"] = make_state["score_differential"] + 3.0
-    make_state["yardline_100"] = 75.0
-    wp_make = ravens_wp_when_opponent_has_ball(make_state)
-
-    # MISS -> opponent ball at LOS
-    miss_state = base_state.copy()
-    wp_miss = ravens_wp_when_opponent_has_ball(miss_state)
-
-    return p_make * wp_make + (1.0 - p_make) * wp_miss
-
-def WP_punt(nsamples=600, rng=None):
-    dists = sample_punt_gross(n=nsamples, rng=rng)
-    wps = []
-    for d in dists:
-        los_from_ravens_end = 100.0 - base_state["yardline_100"]
-        new_field_pos = los_from_ravens_end + float(d)
-        if new_field_pos >= 100.0:
-            new_field_pos = 80.0  # touchback places ball at opponent 20
-        new_field_pos = float(np.clip(new_field_pos, 0.0, 99.0))
-        new_yl = clamp_yl(100.0 - new_field_pos)
-        opp_start = base_state.copy()
-        opp_start["yardline_100"] = new_yl
-        wps.append(ravens_wp_when_opponent_has_ball(opp_start))
-    return float(np.mean(wps))
-
-# ---------------- Run once ----------------
-if __name__ == "__main__":
-    wp_go = WP_go()
-    wp_fg = WP_fg()
-    wp_punt = WP_punt()
-
-    best = max(wp_go, wp_punt, wp_fg)
-    rec = "GO" if best == wp_go else ("PUNT" if best == wp_punt else "FG")
-
-    print("=== Hypothetical 4th-Down Scenario (edit variables at top) ===")
-    print(f"Yardline_100: {Yardline:.1f} | Quarter: {Quarter:.0f} | Time_remaining: {Time_remaining:.0f}s")
-    print(f"Yds_to_go: {Yds_to_go:.1f} | Timeouts O/D: {Timeouts_offense:.0f}/{Timeouts_defense:.0f}")
-    print(f"Score_diff (Ravens - Opp): {Score_differential:.1f} | Wind: {Wind_speed:.1f} mph")
-    print(f"Offense_strength: {Offense_strength:+.3f} | Opp_defense_strength: {Opp_defense_strength:+.3f}")
-    print("---------------------------------------------------------------")
-    print(f"WP_go   : {wp_go:.4f}")
-    print(f"WP_punt : {wp_punt:.4f}")
-    print(f"WP_fg   : {wp_fg:.4f}")
-    print("---------------------------------------------------------------")
-    print(f"Recommendation: {rec}  |  Regret if choose GO:   {best - wp_go:+.4f}")
-    print(f"                               Regret if choose PUNT: {best - wp_punt:+.4f}")
-    print(f"                               Regret if choose FG:   {best - wp_fg:+.4f}")
+print("=" * 70)
+print("4TH DOWN DECISION ANALYSIS")
+print("=" * 70)
+print(f"\nScenario:")
+print(f"  Yardline: {Yardline:.1f} (distance from opponent end zone)")
+print(f"  Quarter: {Quarter:.0f}")
+print(f"  Time Remaining: {Time_remaining:.0f} seconds")
+print(f"  Yards to Go: {Yds_to_go:.1f}")
+print(f"  Score Differential (Ravens - Opp): {Score_differential:+.1f}")
+print(f"  Wind Speed: {Wind_speed:.1f} mph")
+print(f"  Offense Strength: {Offense_strength:+.3f}")
+print(f"  Opp Defense Strength: {Opp_defense_strength:+.3f}")
+print(f"\nDerived Features:")
+print(f"  Own Territory: {features['own_territory']} (yardline > 50)")
+print(f"  Time Left in Half: {features['time_left_in_half']:.0f} seconds")
+print(f"  Late in Half: {features['late_in_half']} (< 2 minutes)")
+print(f"  End of Half: {features['end_of_half']} (Q2/Q4 with < 5 min)")
+print(f"  Down by >3: {features['down_by_more_than_3']} (score_diff < -3)")
+print(f"  Yardline > 40: {features['yardline_over_40']}")
+print("\n" + "-" * 70)
+print("EXPECTED WIN PROBABILITY AFTER EACH DECISION:")
+if constraint_applied:
+    print("  (Note: FG WP adjusted to be >= Punt WP for yardline < 40)")
+print("-" * 70)
+print(f"  GO FOR IT:   {wp_go:.4f} ({wp_go*100:.2f}%)")
+print(f"  PUNT:        {wp_punt:.4f} ({wp_punt*100:.2f}%)")
+print(f"  FIELD GOAL:  {wp_fg:.4f} ({wp_fg*100:.2f}%)")
+print("-" * 70)
+print(f"\nRECOMMENDATION: {rec}")
+print(f"\nRegret Analysis (difference from best option):")
+print(f"  If choose GO:   {best - wp_go:+.4f} ({((best - wp_go)*100):+.2f}%)")
+print(f"  If choose PUNT: {best - wp_punt:+.4f} ({((best - wp_punt)*100):+.2f}%)")
+print(f"  If choose FG:   {best - wp_fg:+.4f} ({((best - wp_fg)*100):+.2f}%)")
+print("=" * 70)

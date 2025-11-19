@@ -1,9 +1,8 @@
 # mvp_4th_down_bot.py
-# Train models for a 4th-down bot:
-#  - WP model: maps game state -> win probability for current offense
-#  - FG model: P(make | distance, wind, temp, roof)
-#  - GO model: P(convert | yardline_100, ydstogo, qtr, time, ratings) using ONLY 4th-down run/pass attempts
-#  - Punt sampler: historical gross punt distribution (MVP)
+# Train models for 4th-down decision making:
+#  - Go-for-it WP model: predicts win probability after going for it
+#  - Field Goal WP model: predicts win probability after attempting FG
+#  - Punt WP model: predicts win probability after punting
 #
 # Requirements:
 #   pip install pandas numpy scikit-learn joblib
@@ -12,11 +11,9 @@ import numpy as np
 import pandas as pd
 import joblib
 from pathlib import Path
-
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error
 from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
@@ -25,274 +22,334 @@ from sklearn.impute import SimpleImputer
 # ----------------------------
 # Config
 # ----------------------------
-SEASONS = list(range(2010, 2025))
-PBP_CACHE = Path("pbp_2010_onwards.parquet")  # cached all-team play-by-play
+MODEL_DIR = Path("models")
+MODEL_DIR.mkdir(exist_ok=True)
 
-MODEL_DIR = Path("models"); MODEL_DIR.mkdir(exist_ok=True)
-WP_MODEL_PATH  = MODEL_DIR / "wp_model.joblib"
-FG_MODEL_PATH  = MODEL_DIR / "fg_model.joblib"
-GO_MODEL_PATH  = MODEL_DIR / "go_conv_model.joblib"
-PUNT_DIST_PATH = MODEL_DIR / "punt_gross_dist.npy"
-
-# Features expected by models
-WP_FEATURES = [
-    "yardline_100",
-    "qtr",
-    "game_seconds_remaining",
-    "posteam_timeouts_remaining",
-    "defteam_timeouts_remaining",
-    "score_differential",
-    "offensive_rating",
-    "opponent_defensive_rating",
-]
-
-FG_FEATURES = ["kick_distance", "temp", "wind", "roof_is_indoor"]
-
-GO_FEATURES = [
-    "yardline_100",
-    "ydstogo",
-    "qtr",
-    "game_seconds_remaining",
-    "score_differential",
-    "posteam_timeouts_remaining",
-    "defteam_timeouts_remaining",
-    "offensive_rating",
-    "opponent_defensive_rating",
-]
+GO_WP_MODEL_PATH = MODEL_DIR / "go_wp_model.joblib"
+FG_WP_MODEL_PATH = MODEL_DIR / "fg_wp_model.joblib"
+PUNT_WP_MODEL_PATH = MODEL_DIR / "punt_wp_model.joblib"
 
 RANDOM_STATE = 42
 
 # ----------------------------
-# Load plays
+# Load Ravens 4th down data
 # ----------------------------
-if PBP_CACHE.exists():
-    print(f"Loading cached play-by-play from {PBP_CACHE} ...")
-    plays = pd.read_parquet(PBP_CACHE)
-else:
-    print(f"Downloading play-by-play via nflreadpy for seasons {SEASONS} ...")
-    import nflreadpy as nfl
+print("Loading Ravens 4th down data...")
+ravens_full = pd.read_csv("ravens_4th_down_2016_onwards.csv")
+ravens_inputs = pd.read_csv("ravens_4th_down_inputs.csv")
 
-    pbp = nfl.load_pbp(seasons=SEASONS)
-    plays = pbp.to_pandas()
+print(f"Loaded {len(ravens_full)} plays from full dataset")
+print(f"Loaded {len(ravens_inputs)} input scenarios")
 
-    keep_cols = [
-        "season",
-        "game_id",
-        "play_id",
-        "week",
-        "down",
-        "play_type",
-        "first_down",
-        "touchdown",
-        "yards_gained",
-        "yardline_100",
-        "ydstogo",
-        "qtr",
-        "time",
-        "quarter_seconds_remaining",
-        "game_seconds_remaining",
-        "posteam",
-        "defteam",
-        "posteam_type",
-        "posteam_score",
-        "defteam_score",
-        "score_differential",
-        "posteam_timeouts_remaining",
-        "defteam_timeouts_remaining",
-        "home_team",
-        "away_team",
-        "field_goal_attempt",
-        "field_goal_result",
-        "kick_distance",
-        "punt_attempt",
-        "weather",
-        "temp",
-        "wind",
-        "stadium",
-        "surface",
-        "roof",
-        "desc",
-        "wp",
-        "def_wp",
-        "wpa",
-        "ep",
-        "epa",
+# ----------------------------
+# Feature Engineering
+# ----------------------------
+def create_features(df):
+    """Create engineered features for the models."""
+    df = df.copy()
+    
+    # Time left in half (combination of quarter and time remaining)
+    # For Q1/Q2: use quarter_seconds_remaining (first half)
+    # For Q3/Q4: use game_seconds_remaining (second half/end of game)
+    df['time_left_in_half'] = df.apply(
+        lambda row: row['quarter_seconds_remaining'] if row['qtr'] in [1, 2] 
+        else row['game_seconds_remaining'], axis=1
+    )
+    
+    # Own territory indicator (yardline > 50 means own territory)
+    df['own_territory'] = (df['yardline_100'] > 50).astype(int)
+    
+    # Late in half indicator (less than 2 minutes)
+    df['late_in_half'] = (df['time_left_in_half'] < 120).astype(int)
+    
+    # End of half/game (Q2 or Q4 with low time)
+    df['end_of_half'] = ((df['qtr'].isin([2, 4])) & (df['time_left_in_half'] < 300)).astype(int)
+    
+    # Score differential categories
+    df['down_by_more_than_3'] = (df['score_differential'] < -3).astype(int)
+    df['up_by_a_lot'] = (df['score_differential'] > 14).astype(int)
+    
+    # Yardline > 40 indicator (FG and punt logic)
+    df['yardline_over_40'] = (df['yardline_100'] > 40).astype(int)
+    
+    # Non-linear yardline features to capture threshold effects
+    # Distance from 40 yardline (captures the critical threshold)
+    df['distance_from_40'] = df['yardline_100'] - 40.0
+    
+    # Squared distance from 40 (emphasizes the threshold region)
+    df['distance_from_40_squared'] = df['distance_from_40'] ** 2
+    
+    # Piecewise features for different yardline ranges
+    # Inside 40 (FG range): high value, changes slowly
+    df['inside_40'] = (df['yardline_100'] <= 40).astype(int)
+    df['yardline_inside_40'] = df['yardline_100'] * df['inside_40']  # Only non-zero inside 40
+    
+    # Around 40 (critical transition zone): 35-45 yardline
+    df['around_40'] = ((df['yardline_100'] >= 35) & (df['yardline_100'] <= 45)).astype(int)
+    
+    # Beyond 40 (long FG range): changes rapidly
+    df['beyond_40'] = (df['yardline_100'] > 40).astype(int)
+    df['yardline_beyond_40'] = (df['yardline_100'] - 40) * df['beyond_40']  # Distance beyond 40
+    
+    # Interaction: own territory AND not late in half (should reduce go-for-it WP)
+    df['own_territory_not_late'] = (df['own_territory'] == 1) & (df['late_in_half'] == 0)
+    df['own_territory_not_late'] = df['own_territory_not_late'].astype(int)
+    
+    # Interaction: down by more than 3 AND late in half (should increase go-for-it WP)
+    df['down_late'] = (df['down_by_more_than_3'] == 1) & (df['late_in_half'] == 1)
+    df['down_late'] = df['down_late'].astype(int)
+    
+    # Fill missing values for ratings
+    if 'offensive_rating' not in df.columns:
+        df['offensive_rating'] = 0.0
+    if 'opponent_defensive_rating' not in df.columns:
+        df['opponent_defensive_rating'] = 0.0
+    
+    # Fill missing wind
+    if 'wind' not in df.columns:
+        df['wind'] = 0.0
+    df['wind'] = df['wind'].fillna(0.0)
+    
+    return df
+
+ravens_full = create_features(ravens_full)
+
+# ----------------------------
+# 1) Go-for-it WP Model
+# Features: yardline, own_territory, time_left_in_half, end_of_half, 
+#           score_differential, down_by_more_than_3, yds_to_go, 
+#           offensive_rating, opponent_defensive_rating
+# ----------------------------
+print("\n" + "="*60)
+print("Training Go-for-it WP Model")
+print("="*60)
+
+# Get actual 4th down attempts (run or pass)
+# Note: All plays in this dataset are 4th downs
+go_attempts = ravens_full[
+    ravens_full['play_type'].isin(['run', 'pass'])
+].copy()
+
+print(f"Found {len(go_attempts)} 4th down go-for-it attempts")
+
+if len(go_attempts) > 0:
+    # Calculate WP after the attempt
+    # For successful conversions, WP should increase
+    # For failed conversions, WP should decrease
+    # We'll use the next play's WP or estimate from WPA
+    go_attempts['wp_after'] = go_attempts['wp'] + go_attempts['wpa'].fillna(0)
+    go_attempts['wp_after'] = go_attempts['wp_after'].clip(0, 1)
+    
+    # Features for go-for-it model
+    GO_FEATURES = [
+        'yardline_100',
+        'own_territory',
+        'time_left_in_half',
+        'end_of_half',
+        'score_differential',
+        'down_by_more_than_3',
+        'down_late',  # Interaction: down by >3 AND late in half
+        'own_territory_not_late',  # Interaction: own territory AND not late
+        'ydstogo',
+        'offensive_rating',
+        'opponent_defensive_rating'
     ]
-    existing_cols = [c for c in keep_cols if c in plays.columns]
-    plays = plays[existing_cols].copy()
-
-    print(f"Caching filtered play-by-play to {PBP_CACHE} ...")
-    plays.to_parquet(PBP_CACHE, index=False)
-
-# Add optional columns if missing
-for col in ["offensive_rating", "opponent_defensive_rating"]:
-    if col not in plays.columns:
-        plays[col] = 0.0
-
-# Roof indicator (indoor/dome/closed => 1)
-if "roof" in plays.columns:
-    plays["roof_is_indoor"] = plays["roof"].astype(str).str.lower().isin(["indoors", "dome", "closed"]).astype(float)
+    
+    # Prepare data
+    go_X = go_attempts[GO_FEATURES].copy()
+    go_y = go_attempts['wp_after'].copy()
+    
+    # Remove rows with missing critical features
+    mask = go_X[['yardline_100', 'ydstogo', 'time_left_in_half']].notna().all(axis=1)
+    go_X = go_X[mask]
+    go_y = go_y[mask]
+    
+    if len(go_X) > 10:
+        go_pipeline = Pipeline(steps=[
+            ("prep", ColumnTransformer(
+                transformers=[("num", SimpleImputer(strategy="median"), GO_FEATURES)],
+                remainder="drop"
+            )),
+            ("model", GradientBoostingRegressor(
+                random_state=RANDOM_STATE,
+                n_estimators=400,  # More trees for better non-linear capture
+                learning_rate=0.04,  # Slightly lower learning rate with more trees
+                max_depth=5,  # Deeper trees to capture complex interactions
+                subsample=0.9,
+                min_samples_split=15  # Allow more splits for threshold effects
+            ))
+        ])
+        
+        Xtr, Xte, ytr, yte = train_test_split(go_X, go_y, test_size=0.2, random_state=RANDOM_STATE)
+        go_pipeline.fit(Xtr, ytr)
+        pred_te = np.clip(go_pipeline.predict(Xte), 0, 1)
+        mae = mean_absolute_error(yte, pred_te)
+        print(f"Go-for-it WP Model - Test MAE: {mae:.4f}")
+        
+        joblib.dump(go_pipeline, GO_WP_MODEL_PATH)
+        print(f"Saved Go-for-it WP model → {GO_WP_MODEL_PATH}")
+    else:
+        print("Warning: Not enough go-for-it attempts to train model")
+        go_pipeline = None
 else:
-    plays["roof_is_indoor"] = 0.0
-
-# Ensure wind/temp exist (may be NaN)
-for col in ["temp", "wind"]:
-    if col not in plays.columns:
-        plays[col] = np.nan
+    print("Warning: No go-for-it attempts found in data")
+    go_pipeline = None
 
 # ----------------------------
-# 1) Win Probability (WP) model
-#     Target = pre-play wp (nflfastR), calibrated and quick to learn from
+# 2) Field Goal WP Model
+# Features: yardline, time_left_in_half, end_of_half, score_differential,
+#           down_by_more_than_3, wind
+# NOT: yds_to_go, timeouts
 # ----------------------------
-wp_df = plays[pd.notnull(plays.get("wp"))].copy()
-wp_df["wp"] = wp_df["wp"].clip(0, 1)
+print("\n" + "="*60)
+print("Training Field Goal WP Model")
+print("="*60)
 
-for f in WP_FEATURES:
-    if f not in wp_df.columns:
-        wp_df[f] = np.nan
+# Get actual field goal attempts
+fg_attempts = ravens_full[
+    (ravens_full['field_goal_attempt'] == 1)
+].copy()
 
-X_wp = wp_df[WP_FEATURES]
-y_wp = wp_df["wp"].astype(float)
+print(f"Found {len(fg_attempts)} field goal attempts")
 
-wp_pipeline = Pipeline(steps=[
-    ("prep", ColumnTransformer(
-        transformers=[("num", SimpleImputer(strategy="median"), WP_FEATURES)],
-        remainder="drop"
-    )),
-    ("model", GradientBoostingRegressor(
-        random_state=RANDOM_STATE, n_estimators=500, learning_rate=0.03, max_depth=3, subsample=0.9
-    ))
-])
-
-Xtr, Xte, ytr, yte = train_test_split(X_wp, y_wp, test_size=0.2, random_state=RANDOM_STATE)
-wp_pipeline.fit(Xtr, ytr)
-pred_te = np.clip(wp_pipeline.predict(Xte), 0, 1)
-print(f"[WP] Test MAE={mean_absolute_error(yte, pred_te):.4f}")
-joblib.dump(wp_pipeline, WP_MODEL_PATH)
-print(f"Saved WP model → {WP_MODEL_PATH}")
-
-def predict_wp_from_state(state_dict):
-    row = pd.DataFrame([state_dict])
-    for k in WP_FEATURES:
-        if k not in row.columns:
-            row[k] = np.nan
-    wp_hat = wp_pipeline.predict(row[WP_FEATURES])[0]
-    return float(np.clip(wp_hat, 0.0, 1.0))
-
-# ----------------------------
-# 2) Field Goal make model (logistic)
-# ----------------------------
-fg = plays[(plays.get("field_goal_attempt", 0) == 1)].copy()
-fg["made"] = (fg.get("field_goal_result", "").astype(str).str.lower() == "made").astype(int)
-fg = fg[pd.notnull(fg["kick_distance"])].copy()
-
-if len(fg) < 50:
-    print("Warning: Very few FG attempts in data; FG model may be weak.")
-
-fg_X = fg.assign(
-    wind=fg["wind"],
-    temp=fg["temp"],
-    roof_is_indoor=fg["roof_is_indoor"],
-)[FG_FEATURES]
-fg_y = fg["made"]
-
-fg_pipeline = Pipeline(steps=[
-    ("prep", ColumnTransformer(
-        transformers=[("num", Pipeline([("imp", SimpleImputer(strategy="median")),
-                                        ("sc", StandardScaler())]), FG_FEATURES)],
-        remainder="drop"
-    )),
-    ("clf", LogisticRegression(max_iter=300, solver="lbfgs"))
-])
-fg_pipeline.fit(fg_X, fg_y)
-
-for d in [30, 45, 55, 65, 75]:
-    test_row = pd.DataFrame([{"kick_distance": d, "temp": 60.0, "wind": 5.0, "roof_is_indoor": 0.0}])
-    p = fg_pipeline.predict_proba(test_row)[0,1]
-    print(f"[FG] P(make) at {d} yds ≈ {p:.3f}")
-
-joblib.dump(fg_pipeline, FG_MODEL_PATH)
-print(f"Saved FG model → {FG_MODEL_PATH}")
-
-def p_fg_make_from_yardline(yardline_100, wind=0.0, temp=60.0, roof_is_indoor=0.0):
-    dist = float(yardline_100) + 17.0  # LOS yardline_100 + 17 yards
-    row = pd.DataFrame([{"kick_distance": dist, "temp": temp, "wind": wind, "roof_is_indoor": roof_is_indoor}])
-    p = fg_pipeline.predict_proba(row)[0,1]
-    return float(p), dist
-
-# ----------------------------
-# 3) Go-for-it conversion model (STRICT 4th-down run/pass only)
-# ----------------------------
-if "down" not in plays.columns:
-    raise ValueError("Your plays CSV must include a 'down' column to train the 4th-down conversion model correctly.")
-
-go = plays.copy()
-go = go[go["down"] == 4]                          # 4th downs only
-go = go[go["play_type"].isin(["run", "pass"])].copy()  # actual attempts only
-
-# Exclude 'No Play' penalties/pre-snap
-if "desc" in go.columns:
-    go = go[~go["desc"].str.contains("No Play", case=False, na=False)]
-
-# Feature hygiene
-need = ["yardline_100", "ydstogo", "qtr", "game_seconds_remaining"]
-for c in need:
-    go = go[pd.notnull(go[c])]
-
-# Success label: got a new first down or a TD
-go["success"] = ((go.get("first_down", 0) == 1) | (go.get("touchdown", 0) == 1)).astype(int)
-
-# Ratings defaults
-for c in ["offensive_rating", "opponent_defensive_rating"]:
-    if c not in go.columns: go[c] = 0.0
-
-go_X = go[GO_FEATURES].copy()
-go_y = go["success"]
-
-go_pipeline = Pipeline(steps=[
-    ("prep", ColumnTransformer(
-        transformers=[("num", Pipeline([
-            ("imp", SimpleImputer(strategy="median")),
-            ("sc", StandardScaler()),
-        ]), GO_FEATURES)],
-        remainder="drop"
-    )),
-    ("clf", LogisticRegression(
-        max_iter=1500,
-        solver="lbfgs",
-        C=0.7,
-    )),
-])
-go_pipeline.fit(go_X, go_y)
-joblib.dump(go_pipeline, GO_MODEL_PATH)
-print(f"Saved Go conversion model → {GO_MODEL_PATH}")
-
-clf = go_pipeline.named_steps["clf"]
-if hasattr(clf, "coef_"):
-    print("Go-model coefficients:")
-    for name, coef in zip(GO_FEATURES, clf.coef_[0]):
-        print(f"  {name:>26s} : {coef:+.4f}")
-
-def p_go_convert(state):
-    r = pd.DataFrame([state])
-    for k in GO_FEATURES:
-        if k not in r.columns:
-            r[k] = np.nan
-    return float(go_pipeline.predict_proba(r[GO_FEATURES])[0,1])
+if len(fg_attempts) > 0:
+    # Calculate WP after FG attempt
+    # If made: WP increases (score +3, better field position)
+    # If missed: WP decreases (turnover on downs, worse field position)
+    fg_attempts['wp_after'] = fg_attempts['wp'] + fg_attempts['wpa'].fillna(0)
+    fg_attempts['wp_after'] = fg_attempts['wp_after'].clip(0, 1)
+    
+    # Features for FG model - includes non-linear yardline features
+    # to capture the threshold effect around the 40 yardline
+    FG_FEATURES = [
+        'yardline_100',
+        'yardline_over_40',  # Indicator for yardline > 40 (usually punt better)
+        'distance_from_40',  # Linear distance from 40 (captures threshold)
+        'distance_from_40_squared',  # Squared distance (emphasizes threshold region)
+        'inside_40',  # Indicator for inside FG range
+        'around_40',  # Indicator for critical transition zone (35-45)
+        'yardline_beyond_40',  # Distance beyond 40 (rapidly changing region)
+        'time_left_in_half',
+        'end_of_half',
+        'score_differential',
+        'down_by_more_than_3',
+        'wind'
+    ]
+    
+    # Prepare data
+    fg_X = fg_attempts[FG_FEATURES].copy()
+    fg_y = fg_attempts['wp_after'].copy()
+    
+    # Remove rows with missing critical features
+    mask = fg_X[['yardline_100', 'time_left_in_half']].notna().all(axis=1)
+    fg_X = fg_X[mask]
+    fg_y = fg_y[mask]
+    
+    if len(fg_X) > 10:
+        fg_pipeline = Pipeline(steps=[
+            ("prep", ColumnTransformer(
+                transformers=[("num", SimpleImputer(strategy="median"), FG_FEATURES)],
+                remainder="drop"
+            )),
+            ("model", GradientBoostingRegressor(
+                random_state=RANDOM_STATE,
+                n_estimators=400,  # More trees for better non-linear capture
+                learning_rate=0.04,  # Slightly lower learning rate with more trees
+                max_depth=5,  # Deeper trees to capture complex interactions
+                subsample=0.9,
+                min_samples_split=15  # Allow more splits for threshold effects
+            ))
+        ])
+        
+        Xtr, Xte, ytr, yte = train_test_split(fg_X, fg_y, test_size=0.2, random_state=RANDOM_STATE)
+        fg_pipeline.fit(Xtr, ytr)
+        pred_te = np.clip(fg_pipeline.predict(Xte), 0, 1)
+        mae = mean_absolute_error(yte, pred_te)
+        print(f"Field Goal WP Model - Test MAE: {mae:.4f}")
+        
+        joblib.dump(fg_pipeline, FG_WP_MODEL_PATH)
+        print(f"Saved Field Goal WP model → {FG_WP_MODEL_PATH}")
+    else:
+        print("Warning: Not enough FG attempts to train model")
+        fg_pipeline = None
+else:
+    print("Warning: No field goal attempts found in data")
+    fg_pipeline = None
 
 # ----------------------------
-# 4) Punt gross distance sampler (MVP)
+# 3) Punt WP Model
+# Features: yardline, time_left_in_half, end_of_half, score_differential
+# NOT: yds_to_go, timeouts, wind
 # ----------------------------
-punts = plays[(plays.get("punt_attempt", 0) == 1) & pd.notnull(plays.get("kick_distance"))].copy()
-gross = punts["kick_distance"].astype(float).values
-if len(gross) < 10:
-    # fallback typical NFL gross punt distribution
-    gross = np.array([38, 40, 42, 44, 45, 46, 48, 50, 52], dtype=float)
+print("\n" + "="*60)
+print("Training Punt WP Model")
+print("="*60)
 
-np.save(PUNT_DIST_PATH, gross)
-print(f"Saved punt gross distribution (n={len(gross)}) → {PUNT_DIST_PATH}")
+# Get actual punt attempts
+punt_attempts = ravens_full[
+    (ravens_full['punt_attempt'] == 1)
+].copy()
 
-def sample_punt_gross(n=1, rng=None):
-    rng = np.random.default_rng(rng)
-    arr = np.load(PUNT_DIST_PATH)
-    return rng.choice(arr, size=n, replace=True)
+print(f"Found {len(punt_attempts)} punt attempts")
+
+if len(punt_attempts) > 0:
+    # Calculate WP after punt
+    punt_attempts['wp_after'] = punt_attempts['wp'] + punt_attempts['wpa'].fillna(0)
+    punt_attempts['wp_after'] = punt_attempts['wp_after'].clip(0, 1)
+    
+    # Features for punt model
+    PUNT_FEATURES = [
+        'yardline_100',
+        'yardline_over_40',  # Indicator for yardline > 40 (usually punt)
+        'time_left_in_half',
+        'end_of_half',
+        'score_differential'
+    ]
+    
+    # Prepare data
+    punt_X = punt_attempts[PUNT_FEATURES].copy()
+    punt_y = punt_attempts['wp_after'].copy()
+    
+    # Remove rows with missing critical features
+    mask = punt_X[['yardline_100', 'time_left_in_half']].notna().all(axis=1)
+    punt_X = punt_X[mask]
+    punt_y = punt_y[mask]
+    
+    if len(punt_X) > 10:
+        punt_pipeline = Pipeline(steps=[
+            ("prep", ColumnTransformer(
+                transformers=[("num", SimpleImputer(strategy="median"), PUNT_FEATURES)],
+                remainder="drop"
+            )),
+            ("model", GradientBoostingRegressor(
+                random_state=RANDOM_STATE,
+                n_estimators=400,  # More trees for better non-linear capture
+                learning_rate=0.04,  # Slightly lower learning rate with more trees
+                max_depth=5,  # Deeper trees to capture complex interactions
+                subsample=0.9,
+                min_samples_split=15  # Allow more splits for threshold effects
+            ))
+        ])
+        
+        Xtr, Xte, ytr, yte = train_test_split(punt_X, punt_y, test_size=0.2, random_state=RANDOM_STATE)
+        punt_pipeline.fit(Xtr, ytr)
+        pred_te = np.clip(punt_pipeline.predict(Xte), 0, 1)
+        mae = mean_absolute_error(yte, pred_te)
+        print(f"Punt WP Model - Test MAE: {mae:.4f}")
+        
+        joblib.dump(punt_pipeline, PUNT_WP_MODEL_PATH)
+        print(f"Saved Punt WP model → {PUNT_WP_MODEL_PATH}")
+    else:
+        print("Warning: Not enough punt attempts to train model")
+        punt_pipeline = None
+else:
+    print("Warning: No punt attempts found in data")
+    punt_pipeline = None
+
+print("\n" + "="*60)
+print("Training Complete!")
+print("="*60)
+print(f"\nModels saved to: {MODEL_DIR}/")
+print("  - go_wp_model.joblib")
+print("  - fg_wp_model.joblib")
+print("  - punt_wp_model.joblib")
