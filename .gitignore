@@ -38,6 +38,9 @@ Thumbs.db
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# Gradio cache
+.gradio/
+
 # Distribution / packaging
 dist/
 build/
